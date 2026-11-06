@@ -1,0 +1,8 @@
+.pio/
+include/secrets.h
+backup/
+.ota_pw.tmp
+tools/shots/
+secrets.ini
+*.zip
+*.bak
