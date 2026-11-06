@@ -101,7 +101,11 @@ def step_tools():
 def step_wifi():
     print("\n== 2. WiFi ==")
     print("The board only supports 2.4 GHz networks (not 5 GHz).")
-    ssid = ask("WiFi network name")
+    print("You can also skip this: the board opens its own 'DeskBuddy-XXXX' WiFi hotspot when it has no")
+    print("network, and you pick your WiFi from your phone. Same hotspot when you move it to a new network.")
+    ssid = input("WiFi network name (Enter to set it up from your phone later): ").strip()
+    if ssid == "":
+        return "", ""
     password = ask("WiFi password (hidden while typing)", secret=True)
     return ssid, password
 
@@ -203,6 +207,9 @@ def main():
     write_private(SECRETS_INI, ini)
     print(f"Saved {SECRETS_H.relative_to(ROOT)} and {SECRETS_INI.relative_to(ROOT)}.")
 
+    if ssid == "":
+        print("\nNo WiFi entered: after flashing, the board shows 'WIFI SETUP' with a hotspot name and password.")
+        print("Join it on your phone and choose your network on the page that opens.")
     print("\n== Next: flash the board ==")
     print("Plug the CYD into USB. Some boards need the BOOT button held while the upload connects")
     print("(hold it if you see 'Wrong boot mode detected', and release once writing starts).")

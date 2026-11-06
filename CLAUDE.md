@@ -51,6 +51,14 @@ Always screenshot after UI changes. Opening the serial port resets the board (DT
 - The sprite is 8-bit color: very dark yellows/whites quantize to muddy olive; use orange/blue tints for glows.
 - A tap on a dimmed screen (backlight < 30) only wakes it; it must not also change page.
 
+## WiFi setup hotspot
+No network joined 40 s after boot (or none saved), or a 4 s hold on the bands page, opens a WPA2 hotspot
+`DeskBuddy-XXXX` (random password on screen) with a captive page (`startPortal()` in main.cpp). Saved WiFi
+lives in prefs ("ssid"/"pass", namespace "deskbuddy") and overrides `secrets.h`; USB flashing does NOT erase it
+(only erase_flash does). The setup page is served only to clients on the hotspot (`fromAp()`); leaving the
+portal always restarts the board. To test the page over the LAN, build with `-DPORTAL_TEST_LAN=1`
+(`PLATFORMIO_BUILD_FLAGS`), then rebuild normally. Do not join the board's hotspot from the user's PC without asking.
+
 ## Setting up a SECOND board
 - Give it a unique OTA hostname (e.g. `deskbuddy2` in `platformio.ini` `[common] ota_hostname`) and keep its
   own IP; the first board is `deskbuddy` and stays online.

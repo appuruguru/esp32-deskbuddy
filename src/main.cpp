@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -32,6 +33,11 @@ SPIClass touchSPI(VSPI);
 XPT2046_Touchscreen ts(T_CS, T_IRQ);
 Preferences prefs;
 WebServer web(80);
+DNSServer dns;
+// True while the WiFi setup hotspot is open (see "WiFi setup hotspot" below).
+static bool portalActive = false;
+static void startPortal(bool manual);
+static void portalTap(int x, int y);
 static uint8_t rotation = 0;
 static uint32_t lastInteraction = 0;
 
@@ -1004,7 +1010,7 @@ static void pageTap() {
 // ---- Touch ------------------------------------------------------------------
 static void handleTouch(uint32_t now) {
   static uint32_t lastSeen = 0, downAt = 0, lastLog = 0;
-  static bool down = false, flipDone = false, wakeOnly = false;
+  static bool down = false, flipDone = false, wakeOnly = false, setupDone = false;
   static int downX = 0, downY = 0, lastX = 0, lastY = 0, maxMove = 0;
 
   int x = lastX, y = lastY;  // keep the last position through the debounce window, not (0,0)
@@ -1038,11 +1044,12 @@ static void handleTouch(uint32_t now) {
     }
   }
   bool touching = (now - lastSeen) < 90 && lastSeen != 0;  // debounce flicker
-  bool onFace = screen == SCREEN_FACE;
+  bool onFace = screen == SCREEN_FACE && !portalActive;
 
   if (touching && !down) {  // press
     down = true;
     flipDone = false;
+    setupDone = false;
     wakeOnly = backlight < 30;  // a touch on a dimmed screen only wakes it; it must not also change page
     downAt = now;
     downX = x;
@@ -1065,13 +1072,20 @@ static void handleTouch(uint32_t now) {
       flipScreen();
       if (onFace) setMood(SURPRISED, 800);
     }
+    // Hold the middle of the HF bands page for 4 s to open the WiFi setup hotspot.
+    if (!setupDone && !portalActive && screen == SCREEN_BANDS && !corner && maxMove < 30 && now - downAt > 4000) {
+      setupDone = true;
+      startPortal(true);
+    }
   } else if (!touching && down) {  // release
     down = false;
     f.gxT = f.gyT = 0;
     int dx = lastX - downX, dy = lastY - downY;
     bool swipe = !flipDone && now - downAt < 900 && abs(dx) > 70 && abs(dy) < 80;
     bool tap = !flipDone && now - downAt < 600 && maxMove < 40;
-    if (flipDone) {
+    if (portalActive) {
+      if (tap) portalTap(lastX, lastY);
+    } else if (flipDone) {
       if (onFace) setMood(IDLE);
     } else if (wakeOnly) {
       if (onFace && f.mood == ATTENTION) setMood(IDLE);
@@ -1099,9 +1113,242 @@ static void handleTouch(uint32_t now) {
   }
 }
 
+// ---- WiFi setup hotspot ------------------------------------------------------
+// If the saved network can't be joined within 40 s of boot (moved house, new router, wrong password), or on a
+// 4 s hold on the HF bands page, the board opens its own WPA2 hotspot "DeskBuddy-XXXX" (password shown on
+// screen) with a captive setup page. Credentials are saved in flash (prefs) and override the ones compiled in
+// from secrets.h. Leaving the setup (saving, or tapping the on-screen button) restarts the board.
+#ifndef PORTAL_TEST_LAN
+#define PORTAL_TEST_LAN 0  // test builds only: serve the setup page to LAN clients as well
+#endif
+static String curSsid, curPass;  // credentials in use: saved in flash, else the ones from secrets.h
+static String apSsid, apPass, netOptions;
+static bool portalManual = false, portalSaved = false;
+static uint32_t portalStartedAt = 0, portalRestartAt = 0, portalTryAt = 0, portalTryUntil = 0;
+
+static bool hasCreds() { return curSsid.length() > 0 && curSsid != "YOUR_WIFI_NAME"; }
+
+static void loadCreds() {
+  curSsid = prefs.getString("ssid", WIFI_SSID);
+  curPass = prefs.getString("pass", WIFI_PASS);
+}
+
+// Only clients that joined the hotspot may use the setup page (not other devices on the home network).
+static bool fromAp() {
+#if PORTAL_TEST_LAN
+  return portalActive;
+#else
+  return portalActive && web.client().localIP() == WiFi.softAPIP();
+#endif
+}
+
+static String htmlEsc(const String &s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&':  o += "&amp;"; break;
+      case '<':  o += "&lt;"; break;
+      case '>':  o += "&gt;"; break;
+      case '"':  o += "&quot;"; break;
+      case '\'': o += "&#39;"; break;
+      default:   o += c;
+    }
+  }
+  return o;
+}
+
+static void scanNetworks() {
+  int n = WiFi.scanNetworks();
+  netOptions = "";
+  String seen[20];
+  int cnt = 0;
+  for (int i = 0; i < n && cnt < 20; i++) {
+    String s = WiFi.SSID(i);
+    bool dup = s.length() == 0;
+    for (int j = 0; j < cnt && !dup; j++) dup = seen[j] == s;
+    if (dup) continue;
+    seen[cnt++] = s;
+    netOptions += "<option value=\"" + htmlEsc(s) + "\">" + htmlEsc(s) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  }
+  WiFi.scanDelete();
+}
+
+static String portalPage(const char *msg = "") {
+  String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>DeskBuddy WiFi</title>"
+               "<style>body{font-family:sans-serif;margin:0;padding:20px;background:#111;color:#eee}"
+               "h2{color:#0ff}select,input{width:100%;box-sizing:border-box;padding:12px;margin:6px 0 14px;"
+               "font-size:16px;border-radius:8px;border:0}button{width:100%;padding:14px;font-size:17px;border:0;"
+               "border-radius:8px;background:#0ff;color:#000;font-weight:bold}a{color:#0ff}small{color:#999}"
+               "</style><h2>DeskBuddy WiFi setup</h2>");
+  if (*msg) {
+    h += "<p>";
+    h += msg;
+    h += "</p>";
+  }
+  h += F("<form method=post action=/save><label>Network</label><select name=sel>");
+  h += netOptions;
+  h += F("<option value=''>Other (type below)</option></select>"
+         "<label>Or type the network name</label><input name=ssid maxlength=32 autocapitalize=off autocorrect=off>"
+         "<label>Password</label><input name=pass type=password maxlength=63>"
+         "<button>Save and connect</button></form>"
+         "<p><a href=/rescan>Rescan networks</a></p>"
+         "<small>2.4 GHz networks only. Leave the password empty for an open network.</small>");
+  return h;
+}
+
+static void portalRoutes() {
+  web.on("/rescan", []() {
+    if (!fromAp()) { web.send(404, "text/plain", "not found\n"); return; }
+    scanNetworks();
+    web.sendHeader("Location", "/");
+    web.send(303);
+  });
+  web.on("/save", HTTP_POST, []() {
+    if (!fromAp()) { web.send(404, "text/plain", "not found\n"); return; }
+    String ssid = web.arg("ssid");
+    ssid.trim();
+    if (ssid.length() == 0) ssid = web.arg("sel");
+    String pass = web.arg("pass");
+    if (ssid.length() == 0 || ssid.length() > 32 || (pass.length() > 0 && (pass.length() < 8 || pass.length() > 63))) {
+      web.send(400, "text/html", portalPage("Pick a network, and use a password of 8 to 63 characters."));
+      return;
+    }
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    web.send(200, "text/html",
+             "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+             "<body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'><h2 style='color:#0ff'>Saved</h2>"
+             "<p>DeskBuddy is restarting and will join <b>" + htmlEsc(ssid) + "</b>. You can close this page and "
+             "reconnect your phone to your normal WiFi.</p><p>If it can't connect, this setup hotspot comes back.</p>");
+    Serial.println("WiFi setup: saved new network, restarting");
+    portalSaved = true;  // restart once the response has gone out
+    portalRestartAt = millis() + 1500;
+  });
+  // Phones probe well-known URLs to detect a captive portal; redirecting everything makes them open the page.
+  web.onNotFound([]() {
+    if (fromAp()) {
+      web.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
+      web.send(302);
+    } else {
+      web.send(404, "text/plain", "not found\n");
+    }
+  });
+}
+
+static void startWeb();
+
+static void startPortal(bool manual) {
+  if (portalActive) return;
+  portalManual = manual;
+  portalSaved = false;
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char b[24];
+  snprintf(b, sizeof(b), "DeskBuddy-%02X%02X", mac[4], mac[5]);
+  apSsid = b;
+  snprintf(b, sizeof(b), "%08lu", (unsigned long)(esp_random() % 100000000UL));
+  apPass = b;
+  Serial.printf("WiFi setup: opening hotspot '%s'%s\n", apSsid.c_str(), manual ? " (manual)" : "");
+  if (!manual) {  // nothing to keep connected: drop the failing attempt before scanning
+    WiFi.disconnect(true);
+    delay(100);
+  }
+  WiFi.mode(WIFI_STA);
+  scanNetworks();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apSsid.c_str(), apPass.c_str(), 1, 0, 2);
+  delay(100);
+  dns.start(53, "*", WiFi.softAPIP());
+  startWeb();
+  portalStartedAt = portalTryAt = millis();
+  portalTryUntil = 0;
+  portalActive = true;
+  setBacklight(255);
+}
+
+static void servicePortal(uint32_t now) {
+  dns.processNextRequest();
+  if (portalSaved) {
+    if ((int32_t)(now - portalRestartAt) >= 0) ESP.restart();
+    return;
+  }
+  bool inUse = WiFi.softAPgetStationNum() > 0;
+  if (portalManual) {  // opened by hand: don't leave the hotspot up forever
+    if (!inUse && since(now, portalStartedAt) > 300000) ESP.restart();
+    return;
+  }
+  if (!hasCreds()) return;
+  // Opened because the saved network failed: it may just be down (power cut, router still booting), so keep
+  // trying it quietly, but never while someone is using the hotspot (a connect attempt hops channels).
+  bool trying = portalTryUntil != 0;
+  if (inUse) {
+    if (trying) { WiFi.disconnect(false); portalTryUntil = 0; }
+    portalTryAt = now;
+  } else if (trying) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi setup: saved network is back, restarting");
+      ESP.restart();
+    } else if ((int32_t)(now - portalTryUntil) >= 0) {
+      WiFi.disconnect(false);
+      portalTryUntil = 0;
+      portalTryAt = now;
+    }
+  } else if (since(now, portalTryAt) > 60000) {
+    WiFi.begin(curSsid.c_str(), curPass.c_str());
+    portalTryUntil = now + 15000;
+  }
+}
+
+static bool portalHasButton() { return portalManual || hasCreds(); }
+
+static void portalTap(int x, int y) {
+  if (portalHasButton() && !portalSaved && x > 20 && x < 220 && y > 262 && y < 308) ESP.restart();
+}
+
+static void drawPortal() {
+  spr.fillSprite(TFT_BLACK);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(N_MAGENTA, TFT_BLACK);
+  centerText("WIFI SETUP", W / 2, 8, 4);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  centerText("1. Join this WiFi on your phone:", W / 2, 50, 2);
+  spr.setTextColor(N_CYAN, TFT_BLACK);
+  centerText(apSsid.c_str(), W / 2, 70, 4);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  centerText("Password:", W / 2, 106, 2);
+  spr.setTextColor(N_YELLOW, TFT_BLACK);
+  centerText(apPass.c_str(), W / 2, 124, 4);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  centerText("2. Choose your home network", W / 2, 164, 2);
+  centerText("on the page that opens.", W / 2, 182, 2);
+  centerText("No page? Open this address:", W / 2, 206, 2);
+  spr.setTextColor(N_CYAN, TFT_BLACK);
+  centerText("192.168.4.1", W / 2, 224, 4);
+  if (portalSaved) {
+    spr.setTextColor(N_GREEN, TFT_BLACK);
+    centerText("Saved! Restarting...", W / 2, 276, 4);
+  } else if (portalHasButton()) {
+    spr.drawRoundRect(20, 262, 200, 46, 10, N_MAGENTA);
+    spr.setTextColor(N_MAGENTA, TFT_BLACK);
+    centerText(portalManual ? "Cancel" : "Retry saved WiFi", W / 2, 275, 2);
+    if (!portalManual) {
+      spr.setTextColor(TFT_RED, TFT_BLACK);
+      centerText("Can't reach saved WiFi", W / 2, 246, 2);
+    }
+  }
+  spr.pushSprite(0, 0);
+}
+
 // ---- Web page ---------------------------------------------------------------
 static void startWeb() {
+  static bool running = false;
+  if (running) return;  // called both when WiFi comes up and when the setup hotspot opens
+  running = true;
+  portalRoutes();
   web.on("/", []() {
+    if (fromAp()) { web.send(200, "text/html", portalPage()); return; }
     web.send(200, "text/html",
              "<meta name=viewport content='width=device-width,initial-scale=1'>"
              "<body style='font-family:sans-serif;padding:24px;line-height:2'><h2>DeskBuddy</h2>"
@@ -1302,7 +1549,7 @@ static void beginWifi() {
   delay(100);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(OTA_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(curSsid.c_str(), curPass.c_str());
 }
 
 static void serviceWifi(uint32_t now) {
@@ -1322,11 +1569,14 @@ static void serviceWifi(uint32_t now) {
   }
   wasConnected = connected;
 
+  if (portalActive) return;  // the setup hotspot manages WiFi itself
   if (!connected && now - lastTry > 15000) {
     lastTry = now;
     Serial.printf("WiFi: %s (%d), retrying\n", wifiReason(st), (int)st);
     beginWifi();
   }
+  // Never got online since power-up: open the setup hotspot so the network can be changed from a phone.
+  if (!started && !connected && now > 40000) startPortal(false);
 }
 
 // ---- Arduino entry points ----------------------------------------------------
@@ -1362,7 +1612,9 @@ void setup() {
   ts.begin(touchSPI);
   ts.setRotation(1);
 
-  beginWifi();
+  loadCreds();
+  if (hasCreds()) beginWifi();
+  else startPortal(false);  // nothing saved yet: go straight to the setup hotspot
   setMood(IDLE);
   lastInteraction = millis();
   // Priority 0 (same as idle) so the fetcher time-slices with the idle task instead of starving it.
@@ -1375,6 +1627,7 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   now = millis();  // handlers may have taken a while; keep `now` current for the checks below
+  if (portalActive) servicePortal(now);
 
   static uint32_t lastTick = 0, lastClock = 0;
   if (now - lastTick < 33) return;  // ~30 fps tick
@@ -1382,6 +1635,15 @@ void loop() {
 
   handleTouch(now);
   updateFace(now);
+  if (portalActive) {
+    if (backlight != 255) setBacklight(255);  // the hotspot password must stay readable in a dark room
+    if (screenJustChanged || now - lastClock > 200) {
+      lastClock = now;
+      drawPortal();
+    }
+    screenJustChanged = false;
+    return;
+  }
   updateBacklight(now);
 
   // After a minute asleep, show the clock as an ambient display.

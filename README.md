@@ -16,8 +16,9 @@ python setup.py
 
 (On Windows you can use `py setup.py`.) The setup script:
 1. checks Python and PlatformIO, and offers to install PlatformIO with pip if it is missing;
-2. asks for your WiFi name and password (the password is hidden as you type), your ZIP code or
-   latitude/longitude, your timezone, Fahrenheit/Celsius and 12/24-hour clock;
+2. asks for your WiFi name and password (the password is hidden as you type; or press Enter to set WiFi up
+   from your phone instead, see below), your ZIP code or latitude/longitude, your timezone,
+   Fahrenheit/Celsius and 12/24-hour clock;
 3. asks for a password to protect wireless updates (or generates one);
 4. writes `include/secrets.h` and `secrets.ini` for you, then offers to build and flash the board.
 
@@ -31,6 +32,21 @@ hold BOOT, keep holding it until the upload starts writing, then release.
 Copy `include/secrets.h.example` to `include/secrets.h` and `secrets.ini.example` to `secrets.ini`, fill them in,
 then `pio run -e cyd -t upload`.
 
+### Changing WiFi (new router, moving house, taking it to a friend's)
+No cable or rebuild needed. When the board can't join its WiFi for 40 seconds after power-up (or has no WiFi
+saved), the screen switches to **WIFI SETUP**:
+1. On your phone, join the WiFi shown on the screen (`DeskBuddy-XXXX`, with the password shown there).
+2. A setup page opens by itself (or browse to `192.168.4.1`). Choose your network, enter its password, Save.
+3. The board restarts and joins it. If it still can't connect, the setup screen comes back.
+
+To change the network while the board is still working (for example before you move it), **hold the middle
+of the HF bands page for 4 seconds** to open the same setup screen; "Cancel" on the screen closes it.
+A network saved this way overrides the WiFi in `secrets.h`. The hotspot only serves the setup page to
+devices that joined it, and its password is random each time.
+
+If the board's saved network is only temporarily down (power cut, router still booting), the hotspot appears
+but the board keeps retrying quietly and rejoins by itself when the network returns.
+
 ### Updating later (no cable, no BOOT button)
 Once the board is on your WiFi: `pio run -e cyd_ota -t upload --upload-port <the board's IP address>`.
 The IP is printed on the serial monitor (`pio device monitor`) at boot and shown in your router's device list.
@@ -38,6 +54,8 @@ The IP is printed on the serial monitor (`pio device monitor`) at boot and shown
 ## Controls
 - Swipe left/right: change page. Tap the weather page: live weather scene. Tap the face: it reacts.
 - A tap on a dimmed screen only wakes it.
+- Hold any corner for 2 seconds: flip the screen 180 degrees.
+- Hold the middle of the HF bands page for 4 seconds: WiFi setup hotspot.
 
 ## Dev tools (optional)
 The firmware serves `/screenshot.bmp` and some remote-control endpoints (touch, page, mood, brightness,
